@@ -11,15 +11,18 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "")
 MT5_PATH = os.getenv("MT5_PATH", "")
 
-SYMBOL = os.getenv("SYMBOL", "EURUSD")
-TIMEFRAME_NAME = os.getenv("TIMEFRAME", "M5")
+SYMBOLS_RAW = os.getenv("SYMBOLS", "EURUSD")
+SYMBOLS = [s.strip() for s in SYMBOLS_RAW.split(",") if s.strip()]
+
+TIMEFRAME_NAME = os.getenv("TIMEFRAME", "M1")
 LOT = float(os.getenv("LOT", "0.01"))
 STOP_LOSS_POINTS = int(os.getenv("STOP_LOSS_POINTS", "300"))
 TAKE_PROFIT_POINTS = int(os.getenv("TAKE_PROFIT_POINTS", "600"))
 DEVIATION = int(os.getenv("DEVIATION", "20"))
 MAGIC = int(os.getenv("MAGIC", "123456"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "1"))
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
+MAX_OPEN_POSITIONS_TOTAL = int(os.getenv("MAX_OPEN_POSITIONS_TOTAL", "2"))
+MAX_OPEN_POSITIONS_PER_SYMBOL = int(os.getenv("MAX_OPEN_POSITIONS_PER_SYMBOL", "1"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 TIMEFRAME_MAP = {
@@ -55,18 +58,19 @@ def connect():
     print(f"[INFO] Account: {account.login if account else 'unknown'}")
     print(f"[INFO] Server: {account.server if account else 'unknown'}")
     print(f"[INFO] Terminal connected: {terminal.connected if terminal else 'unknown'}")
+    print(f"[INFO] Watchlist: {SYMBOLS}")
     return True
 
 
 def ensure_symbol(symbol: str):
     info = mt5.symbol_info(symbol)
     if info is None:
-        print(f"[ERROR] Symbol not found: {symbol}")
+        print(f"[{symbol}] [ERROR] Symbol not found")
         return None
 
     if not info.visible:
         if not mt5.symbol_select(symbol, True):
-            print(f"[ERROR] symbol_select failed for {symbol}")
+            print(f"[{symbol}] [ERROR] symbol_select failed")
             return None
 
     return mt5.symbol_info(symbol)
@@ -124,8 +128,11 @@ def analyze_signal(symbol: str, timeframe):
     return signal, curr_fast, curr_slow
 
 
-def get_positions(symbol: str):
-    positions = mt5.positions_get(symbol=symbol)
+def get_positions(symbol: str = None):
+    if symbol:
+        positions = mt5.positions_get(symbol=symbol)
+    else:
+        positions = mt5.positions_get()
     return list(positions) if positions else []
 
 
@@ -151,7 +158,7 @@ def close_position(position):
     filling_mode = get_supported_filling_mode(symbol_info)
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        print(f"[ERROR] No tick for {symbol}")
+        print(f"[{symbol}] [ERROR] No tick for close")
         return None
 
     if position.type == mt5.POSITION_TYPE_BUY:
@@ -176,14 +183,14 @@ def close_position(position):
     }
 
     check = mt5.order_check(request)
-    print(f"[INFO] close order_check: {check}")
+    print(f"[{symbol}] [INFO] close order_check: {check}")
 
     if DRY_RUN:
-        print(f"[DRY RUN] Close not sent for ticket {position.ticket}.")
+        print(f"[{symbol}] [DRY RUN] Close not sent for ticket {position.ticket}.")
         return check
 
     result = mt5.order_send(request)
-    print(f"[INFO] close result: {result}")
+    print(f"[{symbol}] [INFO] close result: {result}")
     return result
 
 
@@ -195,7 +202,7 @@ def open_trade(symbol: str, side: str):
     filling_mode = get_supported_filling_mode(symbol_info)
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        print("[ERROR] Failed to get tick")
+        print(f"[{symbol}] [ERROR] No tick for open")
         return None
 
     point = symbol_info.point
@@ -211,7 +218,7 @@ def open_trade(symbol: str, side: str):
         sl = price + STOP_LOSS_POINTS * point
         tp = price - TAKE_PROFIT_POINTS * point
     else:
-        print("[ERROR] Invalid side")
+        print(f"[{symbol}] [ERROR] Invalid side")
         return None
 
     request = {
@@ -230,94 +237,118 @@ def open_trade(symbol: str, side: str):
     }
 
     check = mt5.order_check(request)
-    print(f"[INFO] open order_check: {check}")
+    print(f"[{symbol}] [INFO] open order_check: {check}")
 
     if DRY_RUN:
-        print(f"[DRY RUN] Open not sent for {side}.")
+        print(f"[{symbol}] [DRY RUN] Open not sent for {side}.")
         return check
 
     result = mt5.order_send(request)
-    print(f"[INFO] open result: {result}")
+    print(f"[{symbol}] [INFO] open result: {result}")
     return result
 
 
 def handle_signal(symbol: str, signal: str):
-    positions = get_positions(symbol)
-    buys, sells = classify_positions(positions)
+    total_positions = get_positions()
+    symbol_positions = get_positions(symbol)
+    buys, sells = classify_positions(symbol_positions)
 
-    print(f"[INFO] Position summary -> buys: {len(buys)}, sells: {len(sells)}")
+    print(
+        f"[{symbol}] [INFO] Position summary -> "
+        f"symbol buys: {len(buys)}, symbol sells: {len(sells)}, total open: {len(total_positions)}"
+    )
 
     if signal == "buy":
         if sells:
-            print("[INFO] Reverse signal to BUY detected. Closing sell positions first.")
+            print(f"[{symbol}] [INFO] Reverse signal to BUY. Closing sells first.")
             for pos in sells:
                 close_position(pos)
 
-        refreshed_positions = get_positions(symbol)
-        refreshed_buys, refreshed_sells = classify_positions(refreshed_positions)
+        total_positions = get_positions()
+        symbol_positions = get_positions(symbol)
+        buys, sells = classify_positions(symbol_positions)
 
-        if len(refreshed_buys) == 0 and len(refreshed_positions) < MAX_OPEN_POSITIONS:
-            print("[INFO] Opening BUY position.")
-            open_trade(symbol, "buy")
-        else:
-            print("[INFO] BUY already open or max positions reached. No new trade.")
+        if len(total_positions) >= MAX_OPEN_POSITIONS_TOTAL:
+            print(f"[{symbol}] [INFO] Total max open positions reached. No new trade.")
+            return
+
+        if len(buys) >= MAX_OPEN_POSITIONS_PER_SYMBOL:
+            print(f"[{symbol}] [INFO] BUY already open for symbol. No new trade.")
+            return
+
+        print(f"[{symbol}] [INFO] Opening BUY position.")
+        open_trade(symbol, "buy")
 
     elif signal == "sell":
         if buys:
-            print("[INFO] Reverse signal to SELL detected. Closing buy positions first.")
+            print(f"[{symbol}] [INFO] Reverse signal to SELL. Closing buys first.")
             for pos in buys:
                 close_position(pos)
 
-        refreshed_positions = get_positions(symbol)
-        refreshed_buys, refreshed_sells = classify_positions(refreshed_positions)
+        total_positions = get_positions()
+        symbol_positions = get_positions(symbol)
+        buys, sells = classify_positions(symbol_positions)
 
-        if len(refreshed_sells) == 0 and len(refreshed_positions) < MAX_OPEN_POSITIONS:
-            print("[INFO] Opening SELL position.")
-            open_trade(symbol, "sell")
-        else:
-            print("[INFO] SELL already open or max positions reached. No new trade.")
+        if len(total_positions) >= MAX_OPEN_POSITIONS_TOTAL:
+            print(f"[{symbol}] [INFO] Total max open positions reached. No new trade.")
+            return
+
+        if len(sells) >= MAX_OPEN_POSITIONS_PER_SYMBOL:
+            print(f"[{symbol}] [INFO] SELL already open for symbol. No new trade.")
+            return
+
+        print(f"[{symbol}] [INFO] Opening SELL position.")
+        open_trade(symbol, "sell")
 
 
 def main():
-    timeframe = TIMEFRAME_MAP.get(TIMEFRAME_NAME, mt5.TIMEFRAME_M5)
+    timeframe = TIMEFRAME_MAP.get(TIMEFRAME_NAME, mt5.TIMEFRAME_M1)
 
     if not connect():
         return
 
-    last_bar_time = None
+    last_bar_times = {}
+
+    for symbol in SYMBOLS:
+        info = ensure_symbol(symbol)
+        if info is None:
+            continue
+        last_bar_times[symbol] = get_latest_bar_time(symbol, timeframe)
+
+    print("[INFO] Bot initialized. Waiting for new candles on watchlist.")
 
     try:
         while True:
-            current_bar_time = get_latest_bar_time(SYMBOL, timeframe)
+            for symbol in SYMBOLS:
+                current_bar_time = get_latest_bar_time(symbol, timeframe)
 
-            if current_bar_time is None:
-                print("[WARN] Could not fetch latest bar time.")
-                time.sleep(POLL_SECONDS)
-                continue
+                if current_bar_time is None:
+                    print(f"[{symbol}] [WARN] Could not fetch latest bar time.")
+                    continue
 
-            if last_bar_time is None:
-                last_bar_time = current_bar_time
-                print("[INFO] Bot initialized. Waiting for next new candle.")
-                time.sleep(POLL_SECONDS)
-                continue
+                previous_bar_time = last_bar_times.get(symbol)
 
-            if current_bar_time != last_bar_time:
-                last_bar_time = current_bar_time
+                if previous_bar_time is None:
+                    last_bar_times[symbol] = current_bar_time
+                    print(f"[{symbol}] [INFO] Initialized candle tracking.")
+                    continue
 
-                signal, fast_ma, slow_ma = analyze_signal(SYMBOL, timeframe)
-                positions = get_positions(SYMBOL)
+                if current_bar_time != previous_bar_time:
+                    last_bar_times[symbol] = current_bar_time
 
-                print(
-                    f"[INFO] New candle detected | Signal: {signal} | "
-                    f"fast_ma: {fast_ma} | slow_ma: {slow_ma} | Open positions: {len(positions)}"
-                )
+                    signal, fast_ma, slow_ma = analyze_signal(symbol, timeframe)
+                    symbol_positions = get_positions(symbol)
 
-                if signal in ("buy", "sell"):
-                    handle_signal(SYMBOL, signal)
-                else:
-                    print("[INFO] No crossover signal on this candle.")
-            else:
-                print("[INFO] Waiting for next candle...")
+                    print(
+                        f"[{symbol}] [INFO] New candle detected | "
+                        f"Signal: {signal} | fast_ma: {fast_ma} | slow_ma: {slow_ma} | "
+                        f"Open positions: {len(symbol_positions)}"
+                    )
+
+                    if signal in ("buy", "sell"):
+                        handle_signal(symbol, signal)
+                    else:
+                        print(f"[{symbol}] [INFO] No crossover signal on this candle.")
 
             time.sleep(POLL_SECONDS)
 
