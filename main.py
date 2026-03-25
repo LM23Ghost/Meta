@@ -35,6 +35,13 @@ TIMEFRAME_MAP = {
     "D1": mt5.TIMEFRAME_D1,
 }
 
+FILLING_MODE_CACHE = {}
+FILLING_CANDIDATES = [
+    mt5.ORDER_FILLING_FOK,
+    mt5.ORDER_FILLING_IOC,
+    mt5.ORDER_FILLING_RETURN,
+]
+
 
 def connect():
     if MT5_PATH:
@@ -59,6 +66,7 @@ def connect():
     print(f"[INFO] Server: {account.server if account else 'unknown'}")
     print(f"[INFO] Terminal connected: {terminal.connected if terminal else 'unknown'}")
     print(f"[INFO] Watchlist: {SYMBOLS}")
+    print(f"[INFO] DRY_RUN: {DRY_RUN}")
     return True
 
 
@@ -74,21 +82,6 @@ def ensure_symbol(symbol: str):
             return None
 
     return mt5.symbol_info(symbol)
-
-
-def get_supported_filling_mode(symbol_info):
-    preferred = [
-        mt5.ORDER_FILLING_RETURN,
-        mt5.ORDER_FILLING_IOC,
-        mt5.ORDER_FILLING_FOK,
-    ]
-
-    filling_mode = getattr(symbol_info, "filling_mode", None)
-
-    if filling_mode in preferred:
-        return filling_mode
-
-    return mt5.ORDER_FILLING_RETURN
 
 
 def get_rates(symbol: str, timeframe, bars: int = 100):
@@ -149,13 +142,51 @@ def classify_positions(positions):
     return buys, sells
 
 
+def is_check_success(check):
+    return check is not None and getattr(check, "retcode", None) == 0
+
+
+def try_order_with_filling_modes(symbol: str, request: dict, action_label: str):
+    cached_mode = FILLING_MODE_CACHE.get(symbol)
+    modes_to_try = []
+
+    if cached_mode is not None:
+        modes_to_try.append(cached_mode)
+
+    for mode in FILLING_CANDIDATES:
+        if mode not in modes_to_try:
+            modes_to_try.append(mode)
+
+    for filling_mode in modes_to_try:
+        test_request = dict(request)
+        test_request["type_filling"] = filling_mode
+
+        check = mt5.order_check(test_request)
+        print(f"[{symbol}] [INFO] {action_label} order_check with filling_mode={filling_mode}: {check}")
+
+        if is_check_success(check):
+            if FILLING_MODE_CACHE.get(symbol) != filling_mode:
+                FILLING_MODE_CACHE[symbol] = filling_mode
+                print(f"[{symbol}] [INFO] Cached working filling mode: {filling_mode}")
+
+            if DRY_RUN:
+                print(f"[{symbol}] [DRY RUN] {action_label} not sent. Valid filling mode={filling_mode}.")
+                return check
+
+            result = mt5.order_send(test_request)
+            print(f"[{symbol}] [INFO] {action_label} result with filling_mode={filling_mode}: {result}")
+            return result
+
+    print(f"[{symbol}] [ERROR] No supported filling mode found for {action_label}.")
+    return None
+
+
 def close_position(position):
     symbol = position.symbol
     symbol_info = ensure_symbol(symbol)
     if symbol_info is None:
         return None
 
-    filling_mode = get_supported_filling_mode(symbol_info)
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         print(f"[{symbol}] [ERROR] No tick for close")
@@ -179,19 +210,9 @@ def close_position(position):
         "magic": MAGIC,
         "comment": "python-bot close",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling_mode,
     }
 
-    check = mt5.order_check(request)
-    print(f"[{symbol}] [INFO] close order_check: {check}")
-
-    if DRY_RUN:
-        print(f"[{symbol}] [DRY RUN] Close not sent for ticket {position.ticket}.")
-        return check
-
-    result = mt5.order_send(request)
-    print(f"[{symbol}] [INFO] close result: {result}")
-    return result
+    return try_order_with_filling_modes(symbol, request, "close")
 
 
 def open_trade(symbol: str, side: str):
@@ -199,7 +220,6 @@ def open_trade(symbol: str, side: str):
     if symbol_info is None:
         return None
 
-    filling_mode = get_supported_filling_mode(symbol_info)
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         print(f"[{symbol}] [ERROR] No tick for open")
@@ -233,19 +253,9 @@ def open_trade(symbol: str, side: str):
         "magic": MAGIC,
         "comment": f"python-bot {side}",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling_mode,
     }
 
-    check = mt5.order_check(request)
-    print(f"[{symbol}] [INFO] open order_check: {check}")
-
-    if DRY_RUN:
-        print(f"[{symbol}] [DRY RUN] Open not sent for {side}.")
-        return check
-
-    result = mt5.order_send(request)
-    print(f"[{symbol}] [INFO] open result: {result}")
-    return result
+    return try_order_with_filling_modes(symbol, request, f"open {side}")
 
 
 def handle_signal(symbol: str, signal: str):
